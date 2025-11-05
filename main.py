@@ -4,19 +4,20 @@ import re
 import sys
 import time
 import random
+import asyncio
 from typing import Optional, Tuple, List, Dict, Any, Set, NamedTuple
 
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from openai import OpenAI, APIError, APITimeoutError, APIConnectionError, APIStatusError
+from openai import OpenAI, APIError, APITimeoutError, APIConnectionError, APIStatusError, AsyncOpenAI
 from tqdm import tqdm
 
 # --- Глобальные переменные и константы ---
 
 # --- Пути к файлам ---
 TRAIN_DATA_PATH = 'baseline/train_data.csv'
-QUESTIONS_PATH = './questions.csv'
+QUESTIONS_PATH = 'baseline/questions.csv'
 SUBMISSION_PATH = 'submission.csv'
 
 # --- Параметры для API ---
@@ -44,14 +45,14 @@ if LLM_API_KEY:
 else:
     print("Ключ LLM_API_KEY не найден. Функции, использующие LLM, могут не работать.")
 
-# Клиент для эмбеддингов
-client_embedder = None
+# Асинхронный клиент для эмбеддингов
+async_client_embedder = None
 if EMBEDDER_API_KEY:
-    client_embedder = OpenAI(
+    async_client_embedder = AsyncOpenAI(
         base_url="https://ai-for-finance-hack.up.railway.app/",
         api_key=EMBEDDER_API_KEY,
     )
-    print(f"Клиент для эмбеддингов инициализирован. Ключ: ...{EMBEDDER_API_KEY[-4:]}")
+    print(f"Асинхронный клиент для эмбеддингов инициализирован. Ключ: ...{EMBEDDER_API_KEY[-4:]}")
 else:
     print("Ключ EMBEDDER_API_KEY не найден. Функции, использующие эмбеддинги, могут не работать.")
 
@@ -63,19 +64,19 @@ class KnowledgeBase(NamedTuple):
 
 # --- Логика из embedding_model.py ---
 
-def get_embedding(text: str, max_retries: int = MAX_API_RETRIES, initial_backoff: int = INITIAL_API_BACKOFF) -> Optional[list[float]]:
+async def get_embedding_async(text: str, max_retries: int = MAX_API_RETRIES, initial_backoff: int = INITIAL_API_BACKOFF) -> Optional[list[float]]:
     """
-    Получает векторное представление (эмбеддинг) для текста.
+    Асинхронно получает векторное представление (эмбеддинг) для текста.
     Использует механизм повторных запросов с экспоненциальной задержкой.
     """
-    if not client_embedder:
-        print("Клиент для эмбеддингов не инициализирован.")
+    if not async_client_embedder:
+        print("Асинхронный клиент для эмбеддингов не инициализирован.")
         return None
 
     backoff_time = initial_backoff
     for attempt in range(max_retries):
         try:
-            response = client_embedder.embeddings.create(
+            response = await async_client_embedder.embeddings.create(
                 model=EMBEDDER_MODEL,
                 input=text
             )
@@ -85,7 +86,7 @@ def get_embedding(text: str, max_retries: int = MAX_API_RETRIES, initial_backoff
                            (isinstance(e, APIStatusError) and e.status_code >= 500)
             if is_retriable and attempt < max_retries - 1:
                 print(f"Ошибка API эмбеддингов (попытка {attempt + 1}/{max_retries}): {e}. Повтор через {backoff_time:.2f} сек.")
-                time.sleep(backoff_time)
+                await asyncio.sleep(backoff_time)
                 backoff_time = (backoff_time * 2) + random.uniform(0, 1)
             else:
                 print(f"Критическая ошибка API эмбеддингов после {attempt + 1} попыток: {e}")
@@ -134,8 +135,16 @@ def get_all_tags(docs_df: pd.DataFrame) -> Tuple[str, ...]:
         all_tags.update(tag.strip() for tag in tags_str.split(','))
     return tuple(sorted(list(all_tags)))
 
-def create_rag_database(file_path: str = TRAIN_DATA_PATH, row_limit: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Создает базу данных для RAG из CSV-файла."""
+CONCURRENT_REQUEST_LIMIT = 120
+
+async def get_embedding_with_item(item: Dict[str, Any], semaphore: asyncio.Semaphore) -> Tuple[Dict[str, Any], Optional[list[float]]]:
+    """Получает эмбеддинг для элемента и возвращает его вместе с элементом, используя семафор."""
+    async with semaphore:
+        embedding = await get_embedding_async(item['cleaned'])
+        return item, embedding
+
+async def create_rag_database_async(file_path: str = TRAIN_DATA_PATH, row_limit: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Асинхронно создает базу данных для RAG из CSV-файла с отображением прогресса и ограничением конкурентности."""
     pattern = r'Обновлено \d{2}\.\d{2}\.\d{4} в \d{1,2}:\d{2}'
     question_pattern = r"^##.*"
     empty_dfs = pd.DataFrame(), pd.DataFrame()
@@ -166,9 +175,15 @@ def create_rag_database(file_path: str = TRAIN_DATA_PATH, row_limit: Optional[in
                 if cleaned:
                     items_to_process.append({'doc_id': doc_id, 'original': chunk, 'cleaned': cleaned})
 
+    semaphore = asyncio.Semaphore(CONCURRENT_REQUEST_LIMIT)
+    tasks = [get_embedding_with_item(item, semaphore) for item in items_to_process]
+    
     final_result = []
-    for item in tqdm(items_to_process, desc="Получение эмбеддингов"):
-        embedding = get_embedding(item['cleaned'])
+    
+    print(f"Запускается асинхронное получение {len(tasks)} эмбеддингов с ограничением в {CONCURRENT_REQUEST_LIMIT} одновременных запросов...")
+    
+    for future in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Получение эмбеддингов"):
+        item, embedding = await future
         if embedding is not None:
             final_result.append((item['doc_id'], item['original'], item['cleaned'], embedding))
 
@@ -181,11 +196,11 @@ def create_rag_database(file_path: str = TRAIN_DATA_PATH, row_limit: Optional[in
     print(f"\nОбработка завершена. Создано {len(docs_df)} документов и {len(chunks_df)} чанков с эмбеддингами.")
     return docs_df, chunks_df
 
-def find_relevant_docs(question: str, selected_tags: tuple, docs_df: pd.DataFrame, chunks_df: pd.DataFrame, top_k: int = 5, vector_weight: float = 0.7, tag_weight: float = 0.3) -> List[Dict[str, Any]]:
+async def find_relevant_docs_async(question: str, selected_tags: tuple, docs_df: pd.DataFrame, chunks_df: pd.DataFrame, top_k: int = 5, vector_weight: float = 0.7, tag_weight: float = 0.3) -> List[Dict[str, Any]]:
     """Находит наиболее релевантные документы, используя гибридный поиск."""
     if chunks_df.empty:
         return []
-    question_embedding = get_embedding(question)
+    question_embedding = await get_embedding_async(question)
     if question_embedding is None:
         print("Не удалось получить эмбеддинг для вопроса.")
         return []
@@ -261,7 +276,7 @@ def choose_tags_LLM(all_tags: Tuple[str, ...], question: str) -> Tuple[str, ...]
     selected_tags = tuple(tag for tag in raw_tags if tag in all_tags)
     return selected_tags
 
-def generate_final_answer(question: str, knowledge_base: KnowledgeBase, all_tags: Tuple[str, ...]) -> str:
+async def generate_final_answer_async(question: str, knowledge_base: KnowledgeBase, all_tags: Tuple[str, ...]) -> str:
     """Генерирует итоговый ответ на вопрос, используя полный RAG-пайплайн."""
     if not client_llm:
         return "Ошибка: Клиент LLM не инициализирован."
@@ -296,7 +311,7 @@ def generate_final_answer(question: str, knowledge_base: KnowledgeBase, all_tags
 
     # 3. RAG
     tags = choose_tags_LLM(all_tags, question)
-    relevant_documents = find_relevant_docs(
+    relevant_documents = await find_relevant_docs_async(
         question=question,
         selected_tags=tags,
         docs_df=knowledge_base.docs_df,
@@ -371,13 +386,13 @@ def run_baseline():
 
 # --- Основная логика и запуск (из main.py) ---
 
-def run_test():
+async def run_test_async():
     """
-    Запускает небольшой тест на нескольких вопросах и ограниченной базе знаний.
+    Запускает небольшой асинхронный тест на нескольких вопросах и ограниченной базе знаний.
     """
     print("--- ЗАПУСК ТЕСТОВОГО РЕЖИМА ---")
     print("\n--- Шаг 1: Создание тестовой базы знаний (10 документов) ---")
-    docs_df, chunks_df = create_rag_database(row_limit=1)
+    docs_df, chunks_df = await create_rag_database_async(row_limit=1)
     if docs_df.empty or chunks_df.empty:
         print("Не удалось создать тестовую базу знаний. Завершение теста.")
         return
@@ -393,16 +408,16 @@ def run_test():
     for i, question in enumerate(test_questions):
         print(f"\n--- Вопрос {i+1}/{len(test_questions)} ---")
         print(f"Вопрос: {question}")
-        answer = generate_final_answer(question=question, knowledge_base=knowledge_base, all_tags=all_tags)
+        answer = await generate_final_answer_async(question=question, knowledge_base=knowledge_base, all_tags=all_tags)
         print(f"Ответ: {answer}")
     print("\n--- ТЕСТОВЫЙ РЕЖИМ ЗАВЕРШЕН ---")
 
-def main():
+async def main_async():
     """
-    Основная функция для запуска всего RAG-пайплайна.
+    Основная асинхронная функция для запуска всего RAG-пайплайна.
     """
     print("--- Шаг 1: Создание или загрузка базы знаний RAG ---")
-    docs_df, chunks_df = create_rag_database()
+    docs_df, chunks_df = await create_rag_database_async()
     if docs_df.empty or chunks_df.empty:
         print("Не удалось создать базу знаний. Завершение работы.")
         return
@@ -423,7 +438,7 @@ def main():
     print("\n--- Шаг 3: Генерация ответов на вопросы ---")
     answer_list = []
     for question in tqdm(questions_list, desc="Генерация ответов"):
-        answer = generate_final_answer(
+        answer = await generate_final_answer_async(
             question=question,
             knowledge_base=knowledge_base,
             all_tags=all_tags
@@ -438,8 +453,8 @@ def main():
 
 if __name__ == "__main__":
     if "--test" in sys.argv:
-        run_test()
+        asyncio.run(run_test_async())
     elif "--baseline" in sys.argv:
         run_baseline()
     else:
-        main()
+        asyncio.run(main_async())
