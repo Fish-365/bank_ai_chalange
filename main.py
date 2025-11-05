@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from openai import OpenAI, APIError, APITimeoutError, APIConnectionError, APIStatusError, AsyncOpenAI
+from openai.types.chat import ChatCompletion
 from tqdm import tqdm
 
 # --- Глобальные переменные и константы ---
@@ -23,6 +24,7 @@ SUBMISSION_PATH = 'submission.csv'
 # --- Параметры для API ---
 MAX_API_RETRIES = 5
 INITIAL_API_BACKOFF = 1
+CONCURRENT_REQUEST_LIMIT = 50 # Ограничение для запросов к API
 
 # --- Загрузка переменных окружения ---
 load_dotenv()
@@ -34,7 +36,7 @@ EMBEDDER_MODEL = 'text-embedding-3-small'
 LLM_MODEL_NAME = "openrouter/mistralai/mistral-small-3.2-24b-instruct"
 
 # --- Инициализация клиентов OpenAI ---
-# Клиент для LLM
+# Синхронный клиент для baseline
 client_llm = None
 if LLM_API_KEY:
     client_llm = OpenAI(
@@ -44,6 +46,18 @@ if LLM_API_KEY:
     print(f"Клиент LLM инициализирован. Ключ: ...{LLM_API_KEY[-4:]}")
 else:
     print("Ключ LLM_API_KEY не найден. Функции, использующие LLM, могут не работать.")
+
+# Асинхронный клиент для LLM
+async_client_llm = None
+if LLM_API_KEY:
+    async_client_llm = AsyncOpenAI(
+        base_url="https://ai-for-finance-hack.up.railway.app/",
+        api_key=LLM_API_KEY,
+    )
+    print(f"Асинхронный клиент LLM инициализирован. Ключ: ...{LLM_API_KEY[-4:]}")
+else:
+    print("Ключ LLM_API_KEY не найден. Асинхронные функции, использующие LLM, могут не работать.")
+
 
 # Асинхронный клиент для эмбеддингов
 async_client_embedder = None
@@ -62,12 +76,11 @@ class KnowledgeBase(NamedTuple):
     docs_df: pd.DataFrame
     chunks_df: pd.DataFrame
 
-# --- Логика из embedding_model.py ---
+# --- Логика API с повторными попытками ---
 
 async def get_embedding_async(text: str, max_retries: int = MAX_API_RETRIES, initial_backoff: int = INITIAL_API_BACKOFF) -> Optional[list[float]]:
     """
-    Асинхронно получает векторное представление (эмбеддинг) для текста.
-    Использует механизм повторных запросов с экспоненциальной задержкой.
+    Асинхронно и надежно получает векторное представление (эмбеддинг) для текста.
     """
     if not async_client_embedder:
         print("Асинхронный клиент для эмбеддингов не инициализирован.")
@@ -97,7 +110,46 @@ async def get_embedding_async(text: str, max_retries: int = MAX_API_RETRIES, ini
     print("Не удалось получить эмбеддинг после всех попыток.")
     return None
 
-# --- Логика из read_base.py ---
+async def create_completion_async(
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: Optional[int] = None,
+    max_retries: int = MAX_API_RETRIES,
+    initial_backoff: int = INITIAL_API_BACKOFF
+) -> Optional[ChatCompletion]:
+    """
+    Асинхронно и надежно получает ответ от языковой модели.
+    """
+    if not async_client_llm:
+        print("Асинхронный клиент LLM не инициализирован.")
+        return None
+
+    backoff_time = initial_backoff
+    for attempt in range(max_retries):
+        try:
+            params = {"model": LLM_MODEL_NAME, "messages": messages, "temperature": temperature}
+            if max_tokens:
+                params["max_tokens"] = max_tokens
+            
+            response = await async_client_llm.chat.completions.create(**params)
+            return response
+        except (APITimeoutError, APIConnectionError, APIStatusError) as e:
+            is_retriable = isinstance(e, (APITimeoutError, APIConnectionError)) or \
+                           (isinstance(e, APIStatusError) and e.status_code >= 500)
+            if is_retriable and attempt < max_retries - 1:
+                print(f"Ошибка API LLM (попытка {attempt + 1}/{max_retries}): {e}. Повтор через {backoff_time:.2f} сек.")
+                await asyncio.sleep(backoff_time)
+                backoff_time = (backoff_time * 2) + random.uniform(0, 1)
+            else:
+                print(f"Критическая ошибка API LLM после {attempt + 1} попыток: {e}")
+                return None
+        except APIError as e:
+            print(f"Неустранимая ошибка API LLM: {e}")
+            return None
+    print("Не удалось получить ответ от LLM после всех попыток.")
+    return None
+
+# --- Логика обработки данных ---
 
 def clean_text(text: str) -> str:
     """Очищает текст: lowercase, удаляет лишние пробелы и неалфавитные символы."""
@@ -134,8 +186,6 @@ def get_all_tags(docs_df: pd.DataFrame) -> Tuple[str, ...]:
     for tags_str in docs_df['tags'].dropna():
         all_tags.update(tag.strip() for tag in tags_str.split(','))
     return tuple(sorted(list(all_tags)))
-
-CONCURRENT_REQUEST_LIMIT = 120
 
 async def get_embedding_with_item(item: Dict[str, Any], semaphore: asyncio.Semaphore) -> Tuple[Dict[str, Any], Optional[list[float]]]:
     """Получает эмбеддинг для элемента и возвращает его вместе с элементом, используя семафор."""
@@ -196,6 +246,8 @@ async def create_rag_database_async(file_path: str = TRAIN_DATA_PATH, row_limit:
     print(f"\nОбработка завершена. Создано {len(docs_df)} документов и {len(chunks_df)} чанков с эмбеддингами.")
     return docs_df, chunks_df
 
+# --- Логика RAG ---
+
 async def find_relevant_docs_async(question: str, selected_tags: tuple, docs_df: pd.DataFrame, chunks_df: pd.DataFrame, top_k: int = 5, vector_weight: float = 0.7, tag_weight: float = 0.3) -> List[Dict[str, Any]]:
     """Находит наиболее релевантные документы, используя гибридный поиск."""
     if chunks_df.empty:
@@ -246,71 +298,67 @@ async def find_relevant_docs_async(question: str, selected_tags: tuple, docs_df:
         })
     return result
 
-# --- Логика из model.py ---
-
-def choose_tags_LLM(all_tags: Tuple[str, ...], question: str) -> Tuple[str, ...]:
-    """Выбирает релевантные теги для вопроса с помощью LLM."""
-    if not client_llm:
-        print("Клиент LLM не инициализирован. Невозможно выбрать теги.")
+async def choose_tags_LLM_async(all_tags: Tuple[str, ...], question: str) -> Tuple[str, ...]:
+    """Асинхронно и надежно выбирает релевантные теги для вопроса с помощью LLM."""
+    if not async_client_llm:
+        print("Асинхронный клиент LLM не инициализирован. Невозможно выбрать теги.")
         return tuple()
         
     tags_list = ", ".join(all_tags)
-    prompt = f"""Ты — точный и строгий ИИ-классификатор. Твоя задача — из списка тегов выбрать все, которые относятся к вопросу пользователя.
+    prompt = f"""Ты — точный и строгий ИИ-классификатор. Твоя задача — из списка тегов выбрать все, которые относятся к вопросу пользователя.\n\nСПИСОК ТЕГОВ: [{tags_list}]\n\nВОПРОС: {question}\n\nОтветь ТОЛЬКО списком релевантных тегов, разделенных через \"_|_\" без пробелов. Например: тег1_|_тег2.\nЕсли ни один тег не подходит, верни пустую строку."""
 
-СПИСОК ТЕГОВ: [{tags_list}]
-
-ВОПРОС: {question}
-
-Ответь ТОЛЬКО списком релевантных тегов, разделенных через "_|_" без пробелов. Например: тег1_|_тег2.
-Если ни один тег не подходит, верни пустую строку."""
-
-    completion = client_llm.chat.completions.create(
-        model=LLM_MODEL_NAME,
+    completion = await create_completion_async(
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0
     )
+
+    if not completion or not completion.choices:
+        print("Не удалось получить теги от LLM.")
+        return tuple()
+
     content = completion.choices[0].message.content.strip()
     if not content:
         return tuple()
+    
     raw_tags = [tag.strip() for tag in content.split('_|_') if tag.strip()]
     selected_tags = tuple(tag for tag in raw_tags if tag in all_tags)
     return selected_tags
 
 async def generate_final_answer_async(question: str, knowledge_base: KnowledgeBase, all_tags: Tuple[str, ...]) -> str:
-    """Генерирует итоговый ответ на вопрос, используя полный RAG-пайплайн."""
-    if not client_llm:
-        return "Ошибка: Клиент LLM не инициализирован."
+    """Асинхронно и надежно генерирует итоговый ответ на вопрос, используя полный RAG-пайплайн."""
+    default_error_message = "Извините, произошла техническая ошибка. Попробуйте ваш запрос позже."
+    if not async_client_llm:
+        return "Ошибка: Асинхронный клиент LLM не инициализирован."
 
     # 1. Маршрутизатор
-    prompt = f"""Ты — ИИ-маршрутизатор. Определи, нужен ли для ответа на вопрос доступ к базе знаний банка.
-- Ответь "да", если вопрос о банковских продуктах, услугах, тарифах, документах.
-- Ответь "нет", если это общее приветствие, прощание или вопрос не по теме банка.
-
-Вопрос: {question}
-
-Ответь одним словом: "да" или "нет"."""
-    completion_router = client_llm.chat.completions.create(
-        model=LLM_MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
+    prompt_router = f"""Ты — ИИ-маршрутизатор. Определи, нужен ли для ответа на вопрос доступ к базе знаний банка.\n- Ответь \"да\", если вопрос о банковских продуктах, услугах, тарифах, документах.\n- Ответь \"нет\", если это общее приветствие, прощание или вопрос не по теме банка.\n\nВопрос: {question}\n\nОтветь одним словом: \"да\" или \"нет\"."""
+    completion_router = await create_completion_async(
+        messages=[{"role": "user", "content": prompt_router}],
         temperature=0.0
     )
+
+    if not completion_router or not completion_router.choices:
+        print("Ошибка маршрутизатора: не удалось получить ответ от LLM.")
+        return default_error_message
+    
     router_result = completion_router.choices[0].message.content.strip().lower()
 
     # 2. Простой ответ
     if "нет" in router_result:
-        prompt_simple = f"""Ты — дружелюбный ассистент банка. Кратко и вежливо ответь на реплику клиента.
-Реплика: {question}
-Ответ:"""
-        completion_simple = client_llm.chat.completions.create(
-            model=LLM_MODEL_NAME,
+        prompt_simple = f"""Ты — дружелюбный ассистент банка. Кратко и вежливо ответь на реплику клиента.\nРеплика: {question}\nОтвет:"""
+        completion_simple = await create_completion_async(
             messages=[{"role": "user", "content": prompt_simple}],
             temperature=0.3,
             max_tokens=150
         )
-        return completion_simple.choices[0].message.content.strip()
+        if completion_simple and completion_simple.choices:
+            return completion_simple.choices[0].message.content.strip()
+        else:
+            print("Ошибка генерации простого ответа: не удалось получить ответ от LLM.")
+            return default_error_message
 
     # 3. RAG
-    tags = choose_tags_LLM(all_tags, question)
+    tags = await choose_tags_LLM_async(all_tags, question)
     relevant_documents = await find_relevant_docs_async(
         question=question,
         selected_tags=tags,
@@ -323,33 +371,20 @@ async def generate_final_answer_async(question: str, knowledge_base: KnowledgeBa
     else:
         context = "Нет релевантной информации."
 
-    prompt_rag = f"""Ты — ассистент нашего банка.
-**Твоя задача — отвечать на вопросы, используя ИСКЛЮЧИТЕЛЬНО предоставленную информацию (контекст). Запрещено использовать общие знания или придумывать детали.**
-**Твои действия:**
-1.  **Если ответ есть в контексте:** Четко и по делу сформулируй его на основе предоставленной информации.
-2.  **Если ответа в контексте НЕТ:** Не пытайся помочь, придумывая ответ. Твоя единственная задача — вежливо направить клиента к официальным источникам. Используй шаблон:
-    *   **Шаблон ответа:** "Извините, но у меня нет ответа на ваш вопрос. Чтобы получить актуальную и точную информацию о [тема вопроса], пожалуйста, обратиться в поддержку чата к специалисту"
-**ЗАПРЕТЫ:**
-*   Никогда не упоминай другие банки.
-*   Никогда не говори клиенту про "контекст" или "базу знаний".
-
----
-
-КОНТЕКСТ:
-{context}
-
-ВОПРОС: {question}
-
-ОТВЕТ:"""
-    completion_rag = client_llm.chat.completions.create(
-        model=LLM_MODEL_NAME,
+    prompt_rag = f"""Ты — ассистент нашего банка.\n**Твоя задача — отвечать на вопросы, используя ИСКЛЮЧИТЕЛЬНО предоставленную информацию (контекст). Запрещено использовать общие знания или придумывать детали.**\n**Твои действия:**\n1.  **Если ответ есть в контексте:** Четко и по делу сформулируй его на основе предоставленной информации.\n2.  **Если ответа в контексте НЕТ:** Не пытайся помочь, придумывая ответ. Твоя единственная задача — вежливо направить клиента к официальным источникам. Используй шаблон:\n    *   **Шаблон ответа:** \"Извините, но у меня нет ответа на ваш вопрос. Чтобы получить актуальную и точную информацию о [тема вопроса], пожалуйста, обратиться в поддержку чата к специалисту\"\n**ЗАПРЕТЫ:**\n*   Никогда не упоминай другие банки.\n*   Никогда не говори клиенту про \"контекст\" или \"базу знаний\".\n\n---\n\nКОНТЕКСТ:\n{context}\n\nВОПРОС: {question}\n\nОТВЕТ:"""
+    completion_rag = await create_completion_async(
         messages=[{"role": "user", "content": prompt_rag}],
         temperature=0.1,
         max_tokens=500
     )
-    return completion_rag.choices[0].message.content.strip()
 
-# --- Логика из baseline/baseline.py ---
+    if completion_rag and completion_rag.choices:
+        return completion_rag.choices[0].message.content.strip()
+    else:
+        print("Ошибка генерации RAG ответа: не удалось получить ответ от LLM.")
+        return default_error_message
+
+# --- Логика Baseline ---
 
 def baseline_answer_generation(question: str) -> str:
     """
@@ -384,7 +419,7 @@ def run_baseline():
     except FileNotFoundError:
         print(f"Ошибка: Файл с вопросами '{QUESTIONS_PATH}' не найден.")
 
-# --- Основная логика и запуск (из main.py) ---
+# --- Основная логика и запуск ---
 
 async def run_test_async():
     """
@@ -412,6 +447,12 @@ async def run_test_async():
         print(f"Ответ: {answer}")
     print("\n--- ТЕСТОВЫЙ РЕЖИМ ЗАВЕРШЕН ---")
 
+async def get_answer_with_index(index: int, question: str, knowledge_base: KnowledgeBase, all_tags: Tuple[str, ...], semaphore: asyncio.Semaphore) -> Tuple[int, str]:
+    """Асинхронно генерирует ответ и возвращает его с исходным индексом."""
+    async with semaphore:
+        answer = await generate_final_answer_async(question, knowledge_base, all_tags)
+        return index, answer
+
 async def main_async():
     """
     Основная асинхронная функция для запуска всего RAG-пайплайна.
@@ -435,18 +476,21 @@ async def main_async():
         print(f"Ошибка: Файл с вопросами '{QUESTIONS_PATH}' не найден. Завершение работы.")
         return
 
-    print("\n--- Шаг 3: Генерация ответов на вопросы ---")
-    answer_list = []
-    for question in tqdm(questions_list, desc="Генерация ответов"):
-        answer = await generate_final_answer_async(
-            question=question,
-            knowledge_base=knowledge_base,
-            all_tags=all_tags
-        )
-        answer_list.append(answer)
+    print("\n--- Шаг 3: Асинхронная генерация ответов на вопросы ---")
+    
+    semaphore = asyncio.Semaphore(CONCURRENT_REQUEST_LIMIT)
+    tasks = [get_answer_with_index(i, q, knowledge_base, all_tags, semaphore) for i, q in enumerate(questions_list)]
+    
+    answers = ["" for _ in questions_list]
+    
+    print(f"Запускается асинхронная генерация {len(tasks)} ответов с ограничением в {CONCURRENT_REQUEST_LIMIT} одновременных запросов...")
+
+    for future in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Генерация ответов"):
+        index, answer = await future
+        answers[index] = answer
 
     print("\n--- Шаг 4: Сохранение результатов ---")
-    questions_df['Ответы на вопрос'] = answer_list
+    questions_df['Ответы на вопрос'] = answers
     questions_df.to_csv(SUBMISSION_PATH, index=False)
     print(f"Результаты успешно сохранены в файл '{SUBMISSION_PATH}'.")
 
